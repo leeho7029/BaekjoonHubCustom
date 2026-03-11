@@ -49,20 +49,29 @@ function startLoader() {
       if (data.hasOwnProperty('username') && data.hasOwnProperty('resultCategory')) {
         const { username, resultCategory } = data;
         if (username !== findUsername()) return;
-        const isAccepted = resultCategory.includes(RESULT_CATEGORY.RESULT_ACCEPTED) ||
-          resultCategory.includes(RESULT_CATEGORY.RESULT_ENG_ACCEPTED);
-        if (!isAccepted) {
+        
+        // 채점 완료 상태인지 확인
+        const isPending = [
+          RESULT_CATEGORY.RESULT_PENDING,
+          RESULT_CATEGORY.RESULT_PENDING_REJUDGE,
+          RESULT_CATEGORY.RESULT_NO_JUDGE,
+          RESULT_CATEGORY.RESULT_PREPARE_FOR_JUDGE,
+          RESULT_CATEGORY.RESULT_JUDGING,
+        ].includes(resultCategory);
+
+        if (isPending) {
           // 채점 중/기다리는 중 등 비완료 상태를 감지
           seenPending = true;
           return;
         }
+
         stopLoader();
         if (seenPending) {
-          console.log('풀이가 맞았습니다. 업로드를 시작합니다.');
+          console.log('채점이 완료되었습니다. 업로드를 시작합니다.');
           startUpload();
         }
         // !seenPending: 이력 페이지 or 재시도. beginUpload()의 SHA 체크가 중복 처리.
-        const bojData = await findData();
+        const bojData = await findData(data);
         await beginUpload(bojData);
       }
     }
@@ -82,33 +91,44 @@ function toastThenStopLoader(toastMessage, errorMessage){
 
 /* 파싱 직후 실행되는 함수 */
 async function beginUpload(bojData) {
-  bojData = preProcessEmptyObj(bojData);
-  log('bojData', bojData);
-  if (isNotEmpty(bojData)) {
-    const stats = await getStats();
-    const hook = await getHook();
+  if (uploadState.uploading) return; // 이미 업로드 중이면 중단
+  uploadState.uploading = true;
 
-    const currentVersion = stats.version;
-    /* 버전 차이가 발생하거나, 해당 hook에 대한 데이터가 없는 경우 localstorage의 Stats 값을 업데이트하고, version을 최신으로 변경한다 */
-    if (isNull(currentVersion) || currentVersion !== getVersion() || isNull(await getStatsSHAfromPath(hook))) {
-      await versionUpdate();
+  try {
+    bojData = preProcessEmptyObj(bojData);
+    log('bojData', bojData);
+    if (bojData) {
+      const stats = await getStats();
+      const hook = await getHook();
+
+      const currentVersion = stats.version;
+      if (isNull(currentVersion) || currentVersion !== getVersion() || isNull(await getStatsSHAfromPath(hook))) {
+        await versionUpdate();
+      }
+
+      cachedSHA = await getStatsSHAfromPath(`${hook}/${bojData.directory}/${bojData.fileName}`)
+      calcSHA = calculateBlobSHA(bojData.code)
+      log('cachedSHA', cachedSHA, 'calcSHA', calcSHA)
+
+      if (isNull(cachedSHA)) {
+        console.log('캐시된 SHA가 없습니다. 새로 업로드합니다.');
+      } else if (cachedSHA == calcSHA) {
+        markUploadedCSS(stats.branches, bojData.directory);
+        console.log(`현재 제출번호를 업로드한 기록이 있습니다.`);
+        uploadState.uploading = false; // 업로드 완료
+        return;
+      }
+      await uploadOneSolveProblemOnGit(bojData, (...args) => {
+        markUploadedCSS(...args);
+        uploadState.uploading = false; // 업로드 완료
+      });
+    } else {
+      uploadState.uploading = false; // bojData가 없으면 업로드 중단
     }
-
-    /* 현재 제출하려는 소스코드가 기존 업로드한 내용과 같다면 중지 */
-    cachedSHA = await getStatsSHAfromPath(`${hook}/${bojData.directory}/${bojData.fileName}`)
-    calcSHA = calculateBlobSHA(bojData.code)
-    log('cachedSHA', cachedSHA, 'calcSHA', calcSHA)
-
-    if (isNull(cachedSHA)) {
-      /* GitHub에서 파일이 삭제된 경우, 새 업로드로 처리 */
-      console.log('캐시된 SHA가 없습니다. 새로 업로드합니다.');
-    } else if (cachedSHA == calcSHA) {
-      markUploadedCSS(stats.branches, bojData.directory);
-      console.log(`현재 제출번호를 업로드한 기록이 있습니다.` /* submissionID ${bojData.submissionId}` */);
-      return;
-    }
-    /* 신규 제출 번호라면 새롭게 커밋  */
-    await uploadOneSolveProblemOnGit(bojData, markUploadedCSS);
+  } catch (e) {
+    console.error('beginUpload failed:', e);
+    markUploadFailedCSS();
+    uploadState.uploading = false; // 에러 발생 시 업로드 중단
   }
 }
 
@@ -119,31 +139,43 @@ let isManualUploading = false;
 async function processManualUploadQueue() {
   if (isManualUploading || manualUploadQueue.length === 0) return;
   isManualUploading = true;
-  while (manualUploadQueue.length > 0) {
-    const { data, button } = manualUploadQueue.shift();
-    button.classList.remove('bjh-upload-icon');
-    button.classList.add('BaekjoonHub_progress');
-    button.title = '업로드 중...';
-    try {
-      const bojData = await findData(data);
-      if (isNotEmpty(bojData)) {
-        await uploadOneSolveProblemOnGit(bojData, markUploadedCSS);
+  
+  const { data, button } = manualUploadQueue.shift();
+  if (uploadState.uploading) { // 다른 업로드가 진행중이면 큐에 다시 넣고 대기
+    manualUploadQueue.unshift({ data, button });
+    isManualUploading = false;
+    return;
+  }
+
+  uploadState.uploading = true;
+  button.classList.remove('bjh-upload-icon');
+  button.classList.add('BaekjoonHub_progress');
+  button.title = '업로드 중...';
+  try {
+    const bojData = await findData(data);
+    if (bojData) {
+      await uploadOneSolveProblemOnGit(bojData, (...args) => {
+        markUploadedCSS(...args);
         button.classList.remove('BaekjoonHub_progress');
         button.classList.add('bjh-upload-success');
         button.title = '업로드 완료';
-      } else {
-        button.classList.remove('BaekjoonHub_progress');
-        button.classList.add('bjh-upload-fail');
-        button.title = '데이터 파싱 실패';
-      }
-    } catch (e) {
-      console.error('Manual upload failed:', e);
+      });
+    } else {
       button.classList.remove('BaekjoonHub_progress');
       button.classList.add('bjh-upload-fail');
-      button.title = '업로드 실패: ' + e.message;
+      button.title = '데이터 파싱 실패';
     }
+  } catch (e) {
+    console.error('Manual upload failed:', e);
+    button.classList.remove('BaekjoonHub_progress');
+    button.classList.add('bjh-upload-fail');
+    button.title = '업로드 실패: ' + e.message;
+  } finally {
+    uploadState.uploading = false;
+    isManualUploading = false;
+    // 큐에 남은 항목이 있으면 즉시 다음 처리 시작
+    setTimeout(processManualUploadQueue, 0);
   }
-  isManualUploading = false;
 }
 
 function injectManualUploadButtons(currentUsername) {
@@ -151,9 +183,6 @@ function injectManualUploadButtons(currentUsername) {
   const table = findFromResultTable();
   if (isEmpty(table)) return;
   for (const row of table) {
-    const isAccepted = row.resultCategory === RESULT_CATEGORY.RESULT_ACCEPTED ||
-                       row.resultCategory === RESULT_CATEGORY.RESULT_PARTIALLY_ACCEPTED;
-    if (!isAccepted) continue;
     if (row.username !== currentUsername) continue;
     const rowEl = document.getElementById(row.elementId);
     if (!rowEl) continue;

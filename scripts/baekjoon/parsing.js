@@ -48,19 +48,25 @@ async function findData(data) {
     if (isNull(data)) {
       let table = findFromResultTable();
       if (isEmpty(table)) return null;
-      table = filter(table, {
-        'resultCategory': RESULT_CATEGORY.RESULT_ACCEPTED,
-        'username': findUsername(),
-        'language': table[0]["language"]
-      })
-      if (isEmpty(table)) return null;
-      // 자동 업로드 시 가장 최근 accepted 제출을 사용 (과거 best가 아닌 현재 제출)
+      
+      // 필터링 없이 본인의 최신 제출을 사용
+      if (table[0].username !== findUsername()) return null;
       data = table[0];
     }
+    
     if (isNaN(Number(data.problemId)) || Number(data.problemId) < 1000) throw new Error(`정책상 대회 문제는 업로드 되지 않습니다. 대회 문제가 아니라고 판단된다면 이슈로 남겨주시길 바랍니다.\n문제 ID: ${data.problemId}`);
-    data = { ...data, ...await findProblemInfoAndSubmissionCode(data.problemId, data.submissionId) };
+    
+    const info = await findProblemInfoAndSubmissionCode(data.problemId, data.submissionId);
+    
+    if (!info) {
+       throw new Error('문제 정보 또는 소스 코드를 가져오는데 실패했습니다.');
+    }
+    
+    data = { ...data, ...info };
+    
     const detail = await makeDetailMessageAndReadme(preProcessEmptyObj(data));
-    return { ...data, ...detail }; // detail 만 반환해도 되나, 확장성을 위해 모든 데이터를 반환합니다.
+    
+    return { ...data, ...detail }; 
   } catch (error) {
     console.error(error);
   }
@@ -75,8 +81,20 @@ async function findData(data) {
 async function makeDetailMessageAndReadme(data) {
   const { problemId, submissionId, result, title, level, problem_tags,
     problem_description, problem_input, problem_output, submissionTime,
-    code, language, memory, runtime, samples } = data;
+    code, language, memory, runtime, samples, resultCategory } = data;
   const score = parseNumberFromString(result);
+
+  let _defaultDir = `백준/${level.replace(/ .*/, '')}/${problemId}. ${convertSingleCharToDoubleChar(title)}`;
+  
+  // 실패한 경우 failed 폴더에 저장
+  if (resultCategory) {
+    if (!resultCategory.includes(RESULT_CATEGORY.RESULT_ACCEPTED) && !resultCategory.includes(RESULT_CATEGORY.RESULT_PARTIALLY_ACCEPTED)) {
+      _defaultDir = `failed/${_defaultDir}`;
+    }
+  } else if (result && !result.includes('맞았습니다')) {
+      _defaultDir = `failed/${_defaultDir}`;
+  }
+
   const directory = await buildDirectory('baekjoon', {
     platform: '백준',
     level: level.replace(/ .*/, ''),
@@ -84,8 +102,9 @@ async function makeDetailMessageAndReadme(data) {
     id: problemId,
     title: convertSingleCharToDoubleChar(title),
     language: langVersionRemove(language, null),
-    _defaultDir: `백준/${level.replace(/ .*/, '')}/${problemId}. ${convertSingleCharToDoubleChar(title)}`,
+    _defaultDir: _defaultDir,
   });
+  
   const message = `[${level}] Title: ${title}, Time: ${runtime} ms, Memory: ${memory} KB`
     + ((isNaN(score)) ? ' ' : `, Score: ${score} point `) // 서브 태스크가 있는 문제로, 점수가 있는 경우 점수까지 커밋 메시지에 표기
     + `-BaekjoonHub`;
@@ -226,11 +245,12 @@ function parseProblemDescription(doc = document) {
   const problem_description = unescapeHtml(doc.getElementById('problem_description').innerHTML.trim());
   const problem_input = doc.getElementById('problem_input')?.innerHTML.trim?.().unescapeHtml?.() || 'Empty'; // eslint-disable-line
   const problem_output = doc.getElementById('problem_output')?.innerHTML.trim?.().unescapeHtml?.() || 'Empty'; // eslint-disable-line
+  const title = doc.getElementById('problem_title')?.innerText.trim() || 'null';
   const samples = parseSampleData(doc);
   if (problemId && problem_description) {
     log(`문제번호 ${problemId}의 내용을 저장합니다.`);
-    updateProblemsFromStats({ problemId, problem_description, problem_input, problem_output, samples});
-    return { problemId, problem_description, problem_input, problem_output, samples};
+    updateProblemsFromStats({ problemId, problem_description, problem_input, problem_output, samples, title});
+    return { problemId, problem_description, problem_input, problem_output, samples, title};
   }
   return {};
 }
@@ -287,21 +307,36 @@ async function getSolvedACById(problemId) {
  * @returns {Object} { problemId, submissionId, code, problem_description, problem_input, problem_output, problem_tags }
  */
 async function findProblemInfoAndSubmissionCode(problemId, submissionId) {
-  log('in find with promise');
   if (!isNull(problemId) && !isNull(submissionId)) {
-    return Promise.all([getProblemDescriptionById(problemId), getSubmitCodeById(submissionId), getSolvedACById(problemId)])
+    return Promise.all([
+      getProblemDescriptionById(problemId).catch(e => { console.error('Error fetching problem description:', e); return null; }), 
+      getSubmitCodeById(submissionId).catch(e => { console.error('Error fetching submit code:', e); return null; }), 
+      getSolvedACById(problemId).catch(e => { console.error('Error fetching solved.ac data:', e); return null; })
+    ])
       .then(([description, code, solvedJson]) => {
-        const problem_tags = solvedJson.tags.flatMap((tag) => tag.displayNames).filter((tag) => tag.language === 'ko').map((tag) => tag.name);
-        const title = solvedJson.titleKo;
-        const level = bj_level[solvedJson.level];
+        if (!description || !code) {
+           console.error('필수 정보 누락 (description or code)');
+           throw new Error('필수 정보 누락');
+        }
+
+        let problem_tags = [];
+        let title = description.title;
+        let level = 'Unrated';
+
+        if (solvedJson) {
+           problem_tags = solvedJson.tags?.flatMap((tag) => tag.displayNames).filter((tag) => tag.language === 'ko').map((tag) => tag.name) || [];
+           title = solvedJson.titleKo || title;
+           if (solvedJson.level) level = bj_level[solvedJson.level];
+        }
 
         const { problem_description, problem_input, problem_output, samples } = description;
         return { problemId, submissionId, title, level, code, problem_description, problem_input, problem_output, problem_tags, samples: samples || [] };
       })
       .catch((err) => {
-        console.log('error ocurred: ', err);
+        console.error('findProblemInfoAndSubmissionCode error:', err);
         uploadState.uploading = false;
         markUploadFailedCSS();
+        return null;
       });
   }
 }
@@ -320,8 +355,10 @@ async function findDatas(datas) {
   });
   const results = [];
   for (const data of enriched) {
-    const detail = await makeDetailMessageAndReadme(preProcessEmptyObj(data));
-    results.push({ ...data, ...detail });
+    if (data.code) { // 정보 가져오기 성공한 경우만
+        const detail = await makeDetailMessageAndReadme(preProcessEmptyObj(data));
+        results.push({ ...data, ...detail });
+    }
   }
   return results;
 }
